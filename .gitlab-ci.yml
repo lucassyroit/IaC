@@ -1,0 +1,349 @@
+### DEFAULT SETTINGS ###
+default:
+  image:
+    name: "$CI_TEMPLATE_REGISTRY_HOST/gitlab-org/terraform-images/stable:latest"
+  cache:
+    key: "${TF_ROOT}"
+    paths:
+      - ${TF_ROOT}/.terraform/
+
+### STAGES ###
+stages:
+  - destroy
+  - start
+  - sast
+  - checks
+  - terraform
+  - database
+  - docker
+  - tests
+  - dast
+  - cleanup
+  - end
+ 
+### SOURCE SCRIPT -> ENABLES FUNCTIONS ###
+before_script:
+  - source $SCRIPT
+
+### START NOTIFICATION ###
+.start_notification:
+  stage: start
+  script:
+    - start_notification
+
+start_notification_testing:
+  extends: .start_notification
+  environment:
+    name: testing
+  rules:
+    - if: $CI_COMMIT_BRANCH == "testing"
+
+start_notification_production:
+  extends: .start_notification
+  environment:
+    name: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+## CHECKING FOR VULNERABILITIES -> SAST ####
+.sast:
+  stage: sast
+  image:
+    name: $SAST_ANALYZER_IMAGE
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+    paths:
+      - ./gl-sast-report.json
+  rules:
+    - when: never
+  variables:
+    SEARCH_MAX_DEPTH: 4
+  allow_failure: true
+  script:
+    - /analyzer run
+
+sast_testing:
+  extends: .sast
+  environment:
+    name: testing
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "testing" && $CI_PIPELINE_SOURCE != "trigger")
+
+### SEND SAST REPORT ###
+.send_sast_report:
+  stage: sast
+  script:
+    - apk add --no-cache jq
+    - sast_notification
+
+send_sast_report_testing:
+  extends: .send_sast_report
+  needs:
+    - sast_testing
+  environment:
+    name: testing
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "testing" && $CI_PIPELINE_SOURCE != "trigger")
+
+## CHECKING THE AWS CREDENTIALS ###
+.validate_aws_credentials:
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  stage: checks
+  script:
+    - check_credentials
+
+validate_aws_credentials_testing:
+  extends: .validate_aws_credentials
+  environment:
+    name: testing
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "testing" && $CI_PIPELINE_SOURCE != "trigger")
+
+validate_aws_credentials_production:
+  extends: .validate_aws_credentials
+  environment:
+    name: production
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "trigger")
+
+### VALIDATE TERRAFORM ###
+.validate_terraform:
+  stage: checks
+  script:
+    - terraform_operation "validate"
+
+validate_terraform_testing:
+  extends: .validate_terraform
+  needs:
+    - validate_aws_credentials_testing
+  environment:
+    name: testing
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "testing" && $CI_PIPELINE_SOURCE != "trigger")
+
+validate_terraform_production:
+  extends: .validate_terraform
+  needs:
+    - validate_aws_credentials_production
+  environment:
+    name: production
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "trigger")
+
+## INIT TERRAFORM ###
+.init_terraform:
+  stage: terraform
+  script:
+    - terraform_operation "init"
+
+init_terraform_testing:
+  extends: .init_terraform
+  environment:
+    name: testing
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "testing" && $CI_PIPELINE_SOURCE != "trigger")
+
+init_terraform_production:
+  extends: .init_terraform
+  environment:
+    name: production
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "trigger")
+
+#### PLAN TERRAFORM ###
+.plan_terraform:
+  stage: terraform
+  script:
+    - terraform_operation "plan"
+  resource_group: ${TF_STATE_NAME}
+  artifacts:
+    public: false
+    paths:
+      - ${TF_ROOT}/plan.cache
+    reports:
+      terraform: ${TF_ROOT}/plan.json
+
+plan_terraform_testing:
+  extends: .plan_terraform
+  needs:
+    - init_terraform_testing
+  environment:
+    name: testing
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "testing" && $CI_PIPELINE_SOURCE != "trigger")
+
+plan_terraform_production:
+  extends: .plan_terraform
+  needs:
+    - init_terraform_production
+  environment:
+    name: production
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "trigger")
+
+### APPLY TERRAFORM ###
+.apply_terraform:
+  stage: terraform
+  script:
+    - terraform_operation "apply"
+    - gitlab-terraform output -json > ./outputs.json
+  artifacts:
+    paths:
+      - ./outputs.json
+
+apply_terraform_testing:
+  extends: .apply_terraform
+  needs:
+    - plan_terraform_testing
+  environment:
+    name: testing
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "testing" && $CI_PIPELINE_SOURCE != "trigger")
+
+apply_terraform_production:
+  extends: .apply_terraform
+  needs:
+    - plan_terraform_production
+  environment:
+    name: production
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "trigger")
+
+### UPDATE CI VARIABLES ##
+.update_variables:
+  stage: terraform
+  script:
+    - update_variables
+
+update_variables_testing:
+  extends: .update_variables
+  needs:
+    - apply_terraform_testing
+  environment:
+    name: testing
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "testing" && $CI_PIPELINE_SOURCE != "trigger")
+
+update_variables_production:
+  extends: .update_variables
+  needs:
+    - apply_terraform_production
+  environment:
+    name: production
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "trigger")
+
+## PUSH THE DOCKER IMAGE ###
+.docker_image:
+  stage: docker
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  services:
+    - docker:20.10.2-dind
+  before_script:
+    - amazon-linux-extras install docker
+    - yum install -y jq
+    - source $SCRIPT
+  script:
+    - push_docker_image
+
+docker_image_testing:
+  extends: .docker_image
+  environment:
+    name: testing
+  rules:
+    - if: $CI_COMMIT_BRANCH == "testing"
+
+docker_image_production:
+  extends: .docker_image
+  environment:
+    name: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+## TESTING IF SERVICES IS RUNNING ###
+.test_services:
+  stage: tests
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  script:
+    - yum install -y jq
+    - aws_tests
+
+test_services_testing:
+  extends: .test_services
+  environment:
+    name: testing
+  rules:
+    - if: $CI_COMMIT_BRANCH == "testing"
+
+test_services_production:
+  extends: .test_services
+  environment:
+    name: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+### CLEANUP EC2 ###
+.cleanup_ec2:
+  stage: cleanup
+  script:
+    - cleanup_ec2
+
+cleanup_ec2_testing:
+  extends: .cleanup_ec2
+  environment:
+    name: testing
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "testing" && $TF_VAR_ec2_count == "1" )
+
+cleanup_ec2_production:
+  extends: .cleanup_ec2
+  environment:
+    name: production
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "main" && $TF_VAR_ec2_count == "1" )
+
+## END NOTIFICATION ###
+.end_notification:
+  stage: end
+  script:
+    - end_notification
+
+end_notification_testing:
+  extends: .end_notification
+  environment:
+    name: testing
+  rules:
+    - if: $CI_COMMIT_BRANCH == "testing"
+
+end_notification_production:
+  extends: .end_notification
+  environment:
+    name: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+### DESTROY TERRAFORM ###
+.destroy_terraform:
+  stage: destroy
+  script:
+  - gitlab-terraform destroy
+ # - terraform_destroy
+
+destroy_terraform_testing:
+  extends: .destroy_terraform
+  environment:
+    name: testing
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "testing" && $DESTROY_TERRAFORM == "true")
+
+destroy_terraform_prodcution:
+  extends: .destroy_terraform
+  environment:
+    name: production
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "main" && $DESTROY_TERRAFORM == "true")
